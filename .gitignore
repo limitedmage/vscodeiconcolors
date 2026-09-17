@@ -1,0 +1,7 @@
+.dotnet/
+.dotnet-home/
+.nuget-packages/
+.build/
+dist/
+src/WorkspaceColorIcons/bin/
+src/WorkspaceColorIcons/obj/
