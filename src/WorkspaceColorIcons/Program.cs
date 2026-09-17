@@ -250,7 +250,7 @@ internal sealed class WatcherApplicationContext : ApplicationContext
     {
         powerSuspended = true;
         resumeTimer.Stop();
-        watcher.RestoreAll();
+        watcher.RestoreAll(retry: false);
         notifyIcon.Text = "Workspace Color Icons - suspended";
     }
 
@@ -476,12 +476,27 @@ internal sealed class WorkspaceWatcher : IDisposable
         var liveHandles = new HashSet<nint>();
         foreach (var window in NativeMethods.GetVisibleWindows())
         {
+            var wasTracked = trackedWindows.TryGetValue(window.Handle, out var tracked);
+            if (wasTracked)
+            {
+                liveHandles.Add(window.Handle);
+            }
+
             string? processPath;
+            string processName;
             try
             {
                 using var process = Process.GetProcessById((int)window.ProcessId);
-                if (process.ProcessName is not ("Code" or "Code - Insiders"))
+                processName = process.ProcessName;
+                var isVsCode = processName is "Code" or "Code - Insiders";
+                var isEdgeDevTools = processName.Equals("msedge", StringComparison.OrdinalIgnoreCase)
+                    && IsEdgeDevToolsWindow(window.Title);
+                if (!isVsCode && !isEdgeDevTools)
                 {
+                    if (wasTracked)
+                    {
+                        RestoreWindow(window.Handle);
+                    }
                     continue;
                 }
 
@@ -496,9 +511,24 @@ internal sealed class WorkspaceWatcher : IDisposable
                 continue;
             }
 
-            var workspaceName = GetWorkspaceName(window.Title);
-            if (workspaceName is null || string.IsNullOrWhiteSpace(processPath))
+            liveHandles.Add(window.Handle);
+            if (string.IsNullOrWhiteSpace(processPath))
             {
+                if (wasTracked)
+                {
+                    RestoreWindow(window.Handle);
+                }
+                continue;
+            }
+
+            var isVsCodeWindow = processName is "Code" or "Code - Insiders";
+            var workspaceName = isVsCodeWindow ? GetWorkspaceName(window.Title) : null;
+            if (isVsCodeWindow && workspaceName is null)
+            {
+                if (wasTracked)
+                {
+                    RestoreWindow(window.Handle);
+                }
                 continue;
             }
 
@@ -513,19 +543,23 @@ internal sealed class WorkspaceWatcher : IDisposable
             smallSize = smallSize > 0 ? smallSize : 16;
             bigSize = bigSize > 0 ? bigSize : 32;
 
-            var iconKey = $"{processPath}|{workspaceName}|{smallSize}|{bigSize}";
-            liveHandles.Add(window.Handle);
-            if (trackedWindows.TryGetValue(window.Handle, out var tracked)
-                && tracked.IconKey == iconKey)
+            var iconKey = isVsCodeWindow
+                ? $"{processPath}|workspace|{workspaceName}|{smallSize}|{bigSize}"
+                : $"{processPath}|edge-devtools|{smallSize}|{bigSize}";
+            if (wasTracked && tracked!.IconKey == iconKey)
             {
                 continue;
             }
 
             if (!iconCache.TryGetValue(iconKey, out var icons))
             {
-                icons = new IconPair(
-                    CreateWorkspaceIcon(workspaceName, smallSize, processPath),
-                    CreateWorkspaceIcon(workspaceName, bigSize, processPath));
+                icons = isVsCodeWindow
+                    ? new IconPair(
+                        CreateWorkspaceIcon(workspaceName!, smallSize, processPath),
+                        CreateWorkspaceIcon(workspaceName!, bigSize, processPath))
+                    : new IconPair(
+                        CreateDebugBadgeIcon(smallSize, processPath),
+                        CreateDebugBadgeIcon(bigSize, processPath));
                 iconCache.Add(iconKey, icons);
             }
 
@@ -542,13 +576,7 @@ internal sealed class WorkspaceWatcher : IDisposable
                     NativeMethods.IconBig,
                     icons.Big,
                     out originalBig);
-                nint originalSmall2 = 0;
-                var small2Set = bigSet && NativeMethods.TrySetIcon(
-                    window.Handle,
-                    NativeMethods.IconSmall2,
-                    icons.Small,
-                    out originalSmall2);
-                if (!small2Set)
+                if (!bigSet)
                 {
                     if (smallSet)
                     {
@@ -574,8 +602,7 @@ internal sealed class WorkspaceWatcher : IDisposable
                     new TrackedWindow(
                         iconKey,
                         originalSmall,
-                        originalBig,
-                        originalSmall2));
+                        originalBig));
             }
             else
             {
@@ -589,12 +616,7 @@ internal sealed class WorkspaceWatcher : IDisposable
                     NativeMethods.IconBig,
                     icons.Big,
                     out _);
-                NativeMethods.TrySetIcon(
-                    window.Handle,
-                    NativeMethods.IconSmall2,
-                    icons.Small,
-                    out _);
-                tracked.IconKey = iconKey;
+                tracked!.IconKey = iconKey;
             }
         }
 
@@ -604,21 +626,21 @@ internal sealed class WorkspaceWatcher : IDisposable
         }
     }
 
-    public void RestoreAll()
+    public void RestoreAll(bool retry = true)
     {
-        foreach (var (handle, tracked) in trackedWindows)
+        var attempts = retry ? 3 : 1;
+        for (var attempt = 0; attempt < attempts && trackedWindows.Count > 0; attempt++)
         {
-            if (!NativeMethods.IsWindow(handle))
+            foreach (var handle in trackedWindows.Keys.ToArray())
             {
-                continue;
+                RestoreWindow(handle);
             }
 
-            NativeMethods.TrySetIcon(handle, NativeMethods.IconSmall, tracked.OriginalSmall, out _);
-            NativeMethods.TrySetIcon(handle, NativeMethods.IconBig, tracked.OriginalBig, out _);
-            NativeMethods.TrySetIcon(handle, NativeMethods.IconSmall2, tracked.OriginalSmall2, out _);
+            if (trackedWindows.Count > 0 && attempt + 1 < attempts)
+            {
+                Thread.Sleep(50);
+            }
         }
-
-        trackedWindows.Clear();
     }
 
     public void Dispose()
@@ -644,7 +666,118 @@ internal sealed class WorkspaceWatcher : IDisposable
         return workspaceName.Length == 0 ? null : workspaceName;
     }
 
+    private static bool IsEdgeDevToolsWindow(string windowTitle)
+    {
+        return windowTitle.Equals("DevTools", StringComparison.OrdinalIgnoreCase)
+            || windowTitle.StartsWith("DevTools - ", StringComparison.OrdinalIgnoreCase);
+    }
+
     private nint CreateWorkspaceIcon(string workspaceName, int size, string executablePath)
+    {
+        using var bitmap = CreateExecutableIconBitmap(size, executablePath);
+        var colors = GetWorkspaceColors(workspaceName);
+        for (var y = 0; y < bitmap.Height; y++)
+        {
+            for (var x = 0; x < bitmap.Width; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.A == 0)
+                {
+                    continue;
+                }
+
+                var color = pixel.GetBrightness() >= 0.38f
+                    ? colors.Secondary
+                    : colors.Primary;
+                bitmap.SetPixel(x, y, Color.FromArgb(pixel.A, color));
+            }
+        }
+
+        return bitmap.GetHicon();
+    }
+
+    private static nint CreateDebugBadgeIcon(int size, string executablePath)
+    {
+        using var bitmap = CreateExecutableIconBitmap(size, executablePath);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+
+        var glyphSize = Math.Max(10f, size * 0.64f);
+        var cornerOffset = size * 0.05f;
+        var glyphBounds = new RectangleF(
+            size - glyphSize + cornerOffset,
+            size - glyphSize + cornerOffset,
+            glyphSize,
+            glyphSize);
+        var scale = glyphSize / 20f;
+        var originX = glyphBounds.Left;
+        var originY = glyphBounds.Top;
+        PointF Point(float x, float y) => new(originX + x * scale, originY + y * scale);
+
+        using var wrenchPath = new GraphicsPath();
+        wrenchPath.StartFigure();
+        wrenchPath.AddBezier(
+            Point(13.5f, 2f),
+            Point(11.35f, 2f),
+            Point(9.45f, 3.52f),
+            Point(9.08f, 5.62f));
+        wrenchPath.AddBezier(
+            Point(9.08f, 5.62f),
+            Point(8.98f, 6.2f),
+            Point(8.98f, 6.78f),
+            Point(9.08f, 7.36f));
+        wrenchPath.AddLine(Point(2.66f, 14.02f), Point(2.66f, 14.02f));
+        wrenchPath.AddBezier(
+            Point(2.66f, 14.02f),
+            Point(1.76f, 14.95f),
+            Point(1.78f, 16.43f),
+            Point(2.7f, 17.33f));
+        wrenchPath.AddBezier(
+            Point(2.7f, 17.33f),
+            Point(3.63f, 18.24f),
+            Point(5.11f, 18.23f),
+            Point(6.03f, 17.32f));
+        wrenchPath.AddLine(Point(6.03f, 17.32f), Point(12.4f, 10.86f));
+        wrenchPath.AddBezier(
+            Point(12.4f, 10.86f),
+            Point(14.48f, 11.38f),
+            Point(16.72f, 10.38f),
+            Point(17.62f, 8.47f));
+        wrenchPath.AddBezier(
+            Point(17.62f, 8.47f),
+            Point(18.06f, 7.54f),
+            Point(18.16f, 6.48f),
+            Point(17.89f, 5.49f));
+        wrenchPath.AddBezier(
+            Point(17.89f, 5.49f),
+            Point(17.78f, 5.08f),
+            Point(17.28f, 4.94f),
+            Point(17.05f, 5.25f));
+        wrenchPath.AddLine(Point(17.05f, 5.25f), Point(14.5f, 7.79f));
+        wrenchPath.AddLine(Point(14.5f, 7.79f), Point(12.2f, 5.5f));
+        wrenchPath.AddLine(Point(12.2f, 5.5f), Point(14.75f, 2.95f));
+        wrenchPath.AddBezier(
+            Point(14.75f, 2.95f),
+            Point(15.06f, 2.64f),
+            Point(14.92f, 2.14f),
+            Point(14.51f, 2.11f));
+        wrenchPath.AddBezier(
+            Point(14.51f, 2.11f),
+            Point(14.18f, 2.04f),
+            Point(13.84f, 2f),
+            Point(13.5f, 2f));
+        wrenchPath.CloseFigure();
+
+        using var wrenchBrush = new LinearGradientBrush(
+            Point(8.5f, 3f),
+            Point(11.36f, 18.58f),
+            Color.FromArgb(245, 248, 250),
+            Color.FromArgb(112, 124, 136));
+        graphics.FillPath(wrenchBrush, wrenchPath);
+        return bitmap.GetHicon();
+    }
+
+    private static Bitmap CreateExecutableIconBitmap(int size, string executablePath)
     {
         var packedSize = (uint)(size | (size << 16));
         var result = NativeMethods.SHDefExtractIcon(
@@ -665,32 +798,11 @@ internal sealed class WorkspaceWatcher : IDisposable
         {
             using var applicationIcon = Icon.FromHandle(largeIcon);
             using var sourceBitmap = applicationIcon.ToBitmap();
-            using var bitmap = new Bitmap(sourceBitmap.Width, sourceBitmap.Height);
-            using (var graphics = Graphics.FromImage(bitmap))
-            {
-                graphics.CompositingMode = CompositingMode.SourceCopy;
-                graphics.DrawImageUnscaled(sourceBitmap, 0, 0);
-            }
-
-            var colors = GetWorkspaceColors(workspaceName);
-            for (var y = 0; y < bitmap.Height; y++)
-            {
-                for (var x = 0; x < bitmap.Width; x++)
-                {
-                    var pixel = bitmap.GetPixel(x, y);
-                    if (pixel.A == 0)
-                    {
-                        continue;
-                    }
-
-                    var color = pixel.GetBrightness() >= 0.38f
-                        ? colors.Secondary
-                        : colors.Primary;
-                    bitmap.SetPixel(x, y, Color.FromArgb(pixel.A, color));
-                }
-            }
-
-            return bitmap.GetHicon();
+            var bitmap = new Bitmap(sourceBitmap.Width, sourceBitmap.Height);
+            using var graphics = Graphics.FromImage(bitmap);
+            graphics.CompositingMode = CompositingMode.SourceCopy;
+            graphics.DrawImageUnscaled(sourceBitmap, 0, 0);
+            return bitmap;
         }
         finally
         {
@@ -740,18 +852,48 @@ internal sealed class WorkspaceWatcher : IDisposable
         return new WorkspaceColors(primary, secondary);
     }
 
+    private bool RestoreWindow(nint handle)
+    {
+        if (!trackedWindows.TryGetValue(handle, out var tracked))
+        {
+            return true;
+        }
+
+        if (!NativeMethods.IsWindow(handle))
+        {
+            trackedWindows.Remove(handle);
+            return true;
+        }
+
+        var smallRestored = NativeMethods.TrySetIcon(
+            handle,
+            NativeMethods.IconSmall,
+            tracked.OriginalSmall,
+            out _);
+        var bigRestored = NativeMethods.TrySetIcon(
+            handle,
+            NativeMethods.IconBig,
+            tracked.OriginalBig,
+            out _);
+        if (smallRestored && bigRestored)
+        {
+            trackedWindows.Remove(handle);
+            return true;
+        }
+
+        return false;
+    }
+
     private sealed record IconPair(nint Small, nint Big);
 
     private sealed class TrackedWindow(
         string iconKey,
         nint originalSmall,
-        nint originalBig,
-        nint originalSmall2)
+        nint originalBig)
     {
         public string IconKey { get; set; } = iconKey;
         public nint OriginalSmall { get; } = originalSmall;
         public nint OriginalBig { get; } = originalBig;
-        public nint OriginalSmall2 { get; } = originalSmall2;
     }
 
     private sealed record WorkspaceColors(Color Primary, Color Secondary);
@@ -762,7 +904,6 @@ internal static class NativeMethods
     internal static readonly nint HwndMessage = new(-3);
     internal static readonly nint IconSmall = 0;
     internal static readonly nint IconBig = 1;
-    internal static readonly nint IconSmall2 = 2;
 
     private const uint WmSetIcon = 0x0080;
     private const uint SmtoBlock = 0x0001;

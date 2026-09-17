@@ -54,6 +54,9 @@ accessibility event hooks to react when top-level windows appear, disappear,
 become active, or change title. Bursts of related events are combined into one
 scan after a short debounce.
 
+Detached Microsoft Edge DevTools windows receive a silver wrench badge over the
+normal Edge icon. Regular Edge browser windows are not changed.
+
 The utility should not normally be able to turn sleep or hibernation into a
 shutdown. If the problem continues with the utility exited, check Windows Event
 Viewer and `powercfg /systemsleepdiagnostics` for driver, firmware, or power
