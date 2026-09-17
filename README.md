@@ -64,18 +64,34 @@ policy failures.
 
 ## Build
 
-Install the .NET 8 SDK, then publish the executable without external NuGet
-packages:
+Install the .NET 8 SDK, then publish one-file executables without external
+NuGet packages:
 
 ```powershell
 dotnet publish .\src\WorkspaceColorIcons\WorkspaceColorIcons.csproj `
   --configuration Release `
-  --output .\dist `
+  --runtime win-arm64 `
+  --self-contained false `
+  --output .\dist\win-arm64 `
+  -p:PublishSingleFile=true `
+  -p:EnableSingleFileAnalyzer=false `
+  -p:DebugType=None `
+  -p:DebugSymbols=false
+
+dotnet publish .\src\WorkspaceColorIcons\WorkspaceColorIcons.csproj `
+  --configuration Release `
+  --runtime win-x64 `
+  --self-contained false `
+  --output .\dist\win-x64 `
+  -p:PublishSingleFile=true `
+  -p:EnableSingleFileAnalyzer=false `
   -p:DebugType=None `
   -p:DebugSymbols=false
 ```
 
-The build creates `dist\WorkspaceColorIcons.exe` and three small supporting
-files. It uses the installed .NET 8 Windows Desktop runtime. Self-contained or
-single-file publishing additionally requires Microsoft runtime/linker packages
-from NuGet.
+Each output directory contains only `WorkspaceColorIcons.exe`. Windows
+executables are architecture-specific, so ARM64 and x64 use separate files.
+These builds still use the installed .NET 8 Windows Desktop runtime.
+
+A self-contained single-file build would also bundle the runtime, but requires
+the architecture-specific Microsoft runtime packages from NuGet.
